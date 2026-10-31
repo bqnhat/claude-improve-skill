@@ -22,11 +22,11 @@ Two modes. Pick by the argument.
    - **Global scope**: `/improve` is the first request of the session, or the argument is `all`. Run `node ${CLAUDE_SKILL_DIR}/scripts/suggest.mjs` (`--days N`, default 7; `--top N`, default 10; about 30 s). It also runs `claude plugin validate` on `~/.claude` and `claude -p /skill-doctor` (`--no-doctor` skips it).
    - Session scope runs `claude plugin validate` too, but reports only files edited in this session.
 2. In session scope, also add problems you can see in this conversation that the script missed: the user correcting a skill's or agent's output in words the script's pattern does not catch, or a skill step that failed or was skipped. Name the skill and quote the user's words. Leave out problems in project code; only skills, agents, hooks, rules and settings belong here.
-3. If nothing is found, say so in one line, name the scope, and offer `/improve all`. Stop.
+3. If nothing is found, say so in one line and name the scope. When the script's `evidence:` lines show a collector `failed`, `partial` or `empty`, say which ones and that "nothing found" is not a clean bill; otherwise offer `/improve all`. Stop.
 4. Otherwise let the user tick items with AskUserQuestion, `multiSelect: true`. Each option: label `#<rank> <target>` (at most 5 words), description = the main reason in plain words in the user's language. AskUserQuestion holds at most 4 options per question and 4 questions, so split the ranked items in rank order into questions of 4 (never leave a question with 1 option: shift one from the previous question), headers like `Items 1–4`. Show at most 16 items. Do not also print the list as text.
 5. Run the ticked items one after another with **Run**, one change per item, finishing each item's keep/revert decision before the next. Nothing ticked: stop.
 
-Signals the script ranks (higher score first): validate errors (3) and warnings (1), skills idle 60+ days by skill-doctor with their listing-token cost, user corrections typed while a skill was active (3 each), agents pointing to a skill that is off or missing (3), eval cases below 1.0, lift near zero, a skill changed after its last eval, uncommitted changes (2 each), skills turned off, subagent model set in several layers.
+Signals the script ranks (higher score first): validate errors (3) and warnings (1), skills idle 60+ days by skill-doctor with their listing-token cost, user corrections typed within a few turns after a local skill ran (3 each), agents pointing to a skill that is off or missing (3), eval cases below 1.0, eval runs that errored, lift near zero, a skill changed after its last eval, uncommitted changes, files in `~/.claude` written successfully in this session (2 each), tool errors within a few calls after a local skill ran (1 each), skills turned off, subagent model set in several layers. Corrections and tool errors are time-window leads marked `possible`, not proof of cause. A plugin skill is never counted as the local skill with the same short name.
 
 ## Run
 
@@ -45,7 +45,9 @@ Run the script in global scope, show the list as a numbered text list (no one is
 
 ## Hard rules
 
-- One change per round. Measure before and after with the same cases, model and judge.
+- One change per round. Measure before and after with the same cases, `--model` and judge, save both with `scripts/record.mjs`, and decide keep or revert only when `scripts/compare.mjs` ends with `verdict: comparable`.
+- Eval suites measure what lives inside the evaluated skill folder. `claude plugin eval` does not load settings, hooks or rules: test hooks and scripts with `node --test`, and report other changes as unmeasured instead of citing a skill score for them.
+- Snapshot before the change and revert only with `scripts/snapshot.mjs`, never `git checkout`, so the user's other edits survive.
 - Ask for a budget in USD before any `claude plugin eval` run; never start one without an amount the user gave in this conversation.
 - The user decides keep or revert. Show the numbers, not a recommendation dressed as a fact.
 - Commit only in the local `~/.claude` repository and never push it.
