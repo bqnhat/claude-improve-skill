@@ -1,0 +1,8 @@
+schema_version: "1.1"
+name: blank-global
+context:
+  scaffold_script: fixture-home.sh
+expected_outcome: |
+  The skill runs suggest.mjs in global scope (no --session) and the saved output lists the fixture skill
+  fixture-alpha with one user correction, reports "improve suggestions: last 7 days", and shows the
+  git status collector as failed because the fixture ~/.claude is not a git repository.

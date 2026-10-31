@@ -3,7 +3,7 @@ import { createReadStream, existsSync, readdirSync, readFileSync, statSync } fro
 import { createInterface } from 'node:readline';
 import os from 'node:os';
 import path from 'node:path';
-import { caseStats, inside, mean } from './common.mjs';
+import { askLayout, caseStats, inside, mean, parseStatus } from './common.mjs';
 
 const ROOT = path.join(os.homedir(), '.claude');
 const DAY_MS = 86400000;
@@ -17,6 +17,11 @@ const DAYS = Number(option('--days', 7));
 const TOP = Number(option('--top', 10));
 const SINCE = Date.now() - DAYS * DAY_MS;
 const sessionArg = option('--session', '');
+const TARGET = argv.includes('--target') ? option('--target', '').replace(/^\//, '') : null;
+if (argv.includes('--target') && (!TARGET || TARGET.startsWith('--'))) {
+  console.error('--target needs a skill, agent, hook or rule name');
+  process.exit(1);
+}
 const SESSION = argv.includes('--session') ? (sessionArg && !sessionArg.startsWith('--') ? sessionArg : process.env.CLAUDE_CODE_SESSION_ID) : null;
 if (argv.includes('--session') && !SESSION) {
   console.error('--session needs an id or CLAUDE_CODE_SESSION_ID');
@@ -39,7 +44,7 @@ const readJson = (file) => {
 const dirs = (dir) => (existsSync(dir) ? readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name) : []);
 const git = (...args) => {
   try {
-    return execFileSync('git', ['-C', ROOT, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return execFileSync('git', ['-C', ROOT, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   } catch {
     return null;
   }
@@ -57,6 +62,7 @@ const note = (name, status, detail = '') => collectors.push({ name, status, deta
 
 const items = new Map();
 const add = (target, kind, weight, reason, action, evidence = []) => {
+  if (!String(target ?? '').trim()) return;
   const key = `${kind}:${target}`;
   const item = items.get(key) || { target, kind, score: 0, reasons: [], action, evidence: [] };
   item.score += weight;
@@ -64,6 +70,11 @@ const add = (target, kind, weight, reason, action, evidence = []) => {
   item.evidence.push(...evidence);
   if (action === 'loop') item.action = 'loop';
   items.set(key, item);
+};
+const groups = [];
+const addGroup = (title, members, weight, reason, action) => {
+  groups.push({ members, weight, reason, action });
+  add(title, 'cleanup', weight, reason, action);
 };
 
 function transcriptFiles() {
@@ -131,6 +142,7 @@ async function scanFile(file, found) {
       }
       continue;
     }
+    const inWindow = SESSION || Date.parse(rec.timestamp) >= SINCE;
     if (rec.type === 'user' && !rec.isSidechain) {
       const content = rec.message?.content;
       const results = Array.isArray(content) ? content.filter((c) => c.type === 'tool_result') : [];
@@ -142,7 +154,7 @@ async function scanFile(file, found) {
       if (active) {
         const n = results.filter((c) => c.is_error).length;
         const owner = ownerOf(active, active.calls < CALLS_AFTER_SKILL);
-        if (n && owner) {
+        if (n && owner && inWindow) {
           const key = `${owner.kind}\u0000${owner.target}`;
           found.toolErrors.set(key, { ...owner, n: (found.toolErrors.get(key)?.n || 0) + n });
         }
@@ -154,11 +166,10 @@ async function scanFile(file, found) {
     const command = /<command-name>\/?([\w:-]+)<\/command-name>/.exec(text);
     if (command) {
       const skill = skillOf(command[1]);
-      if (skill.local || skill.name.includes(':')) active = { ...skill, turns: 0, calls: 0 };
+      active = skill.local || skill.name.includes(':') ? { ...skill, turns: 0, calls: 0 } : null;
       continue;
     }
     if (!text || text.trimStart().startsWith('<') || text.startsWith('This session is being continued')) continue;
-    const inWindow = SESSION || Date.parse(rec.timestamp) >= SINCE;
     const owner = ownerOf(active, active && active.turns <= TURNS_AFTER_SKILL);
     const typed = text.replace(PASTED, ' ');
     if (owner && inWindow && CORRECTION.test(typed)) {
@@ -187,7 +198,7 @@ async function scanCorrections() {
     }
   }
   const detail = [`${files.length} file(s)`, found.badLines ? `${found.badLines} unparsable line(s) skipped` : '', unread.length ? `${unread.length} file(s) unreadable` : ''].filter(Boolean).join(', ');
-  note('transcripts', !files.length ? 'empty' : unread.length ? 'partial' : 'ok', detail);
+  note('transcripts', !files.length ? 'empty' : unread.length || found.badLines ? 'partial' : 'ok', detail);
   const scope = SESSION ? 'in this session' : `last ${DAYS} days`;
   for (const { kind, target, list } of found.hits.values()) {
     const where = kind === 'skill' ? `within ${TURNS_AFTER_SKILL} turns after this skill ran` : target === '(no skill active)' ? 'with no skill active' : 'while a skill outside ~/.claude was active';
@@ -213,12 +224,19 @@ function latestRun(resultsDir) {
 
 function evalSignals() {
   let suites = 0;
+  const unfinished = [];
   for (const name of localSkills) {
     const resultsDir = path.join(ROOT, 'skills', name, 'evals', 'results');
     const run = existsSync(resultsDir) ? latestRun(resultsDir) : null;
     if (!run) continue;
     suites += 1;
     const cases = run.cases.map((c) => ({ name: c.name, ...caseStats(c) }));
+    const skipped = cases.reduce((n, c) => n + c.skippedJudgements, 0);
+    const gaps = [run.partial ? 'partial run (cost ceiling hit)' : '', skipped ? `${skipped} paid judgement(s) skipped` : ''].filter(Boolean);
+    if (gaps.length) {
+      unfinished.push(name);
+      add(name, 'skill', 2, `latest eval did not finish (${gaps.join(', ')}); its scores are incomplete, re-run it before reading them`, 'loop');
+    }
     const errored = cases.filter((c) => c.errors || c.errorsWithout);
     if (errored.length) {
       add(name, 'skill', 2, `latest eval has run errors in ${errored.length} case(s): ${errored.map((c) => `${c.name} ${c.errors}/${c.runs} with, ${c.errorsWithout} without`).join('; ')}; its scores are inconclusive`, 'loop');
@@ -227,17 +245,17 @@ function evalSignals() {
     if (failing.length) {
       add(name, 'skill', 2, `${failing.length} eval case(s) below 1.0: ${failing.map((c) => `${c.name}=${c.withScore.toFixed(2)}`).join(', ')}`, 'loop');
     }
-    const lift = mean(cases.filter((c) => !c.inconclusive && c.withScore != null && c.withoutScore != null).map((c) => c.withScore - c.withoutScore));
+    const lift = mean(cases.map((c) => c.lift).filter((x) => x != null));
     if (lift != null && lift <= 0.05) add(name, 'skill', 2, `adds almost nothing over the no-skill baseline (lift ${lift.toFixed(2)})`, 'loop');
-    const lastCommit = git('log', '-1', '--format=%cI %h', '--', `skills/${name}`);
+    const lastCommit = git('log', '-1', '--format=%cI %h', '--', `skills/${name}`)?.trim();
     if (lastCommit && Date.parse(lastCommit.split(' ')[0]) > Date.parse(run.startedAt)) {
       add(name, 'skill', 2, `changed after its last eval (commit ${lastCommit.split(' ')[1]})`, 'loop');
     }
   }
-  note('eval results', 'ok', `${suites} skill suite(s) with results`);
+  note('eval results', unfinished.length ? 'partial' : 'ok', [`${suites} skill suite(s) with results`, unfinished.length ? `latest eval unfinished for ${unfinished.join(', ')}` : ''].filter(Boolean).join('; '));
 
   const off = Object.keys(overrides).filter((name) => overrides[name] === 'off');
-  if (off.length) add(`${off.length} skills turned off`, 'cleanup', off.length >= 5 ? 2 : 1, `off in skillOverrides: ${off.join(', ')}`, 'cleanup');
+  if (off.length) addGroup(`${off.length} skills turned off`, off, off.length >= 5 ? 2 : 1, `off in skillOverrides: ${off.join(', ')}`, 'cleanup');
 }
 
 const claude = (args, timeout) => {
@@ -284,17 +302,18 @@ function doctorSignals() {
   }
   note('skill-doctor', 'ok', `${rows.length} skill(s)`);
   const daysAgo = (last) => (last === 'never' ? Infinity : last === 'today' ? 0 : Number(last.split(' ')[0]));
-  const groups = new Map();
+  const idle = new Map();
   for (const r of rows.filter((x) => x.context > 0 && daysAgo(x.last) > 60)) {
     const where = r.source === 'userSettings' ? 'local' : r.source === 'claude.ai sync' ? 'claude.ai sync' : `plugin ${r.source}`;
-    const g = groups.get(where) || { names: [], tokens: 0 };
+    const g = idle.get(where) || { names: [], members: [], tokens: 0 };
     g.names.push(`${r.name} (${r.last === 'never' ? 'never used' : `${r.last} ago`})`);
+    g.members.push(r.name);
     g.tokens += r.context;
-    groups.set(where, g);
+    idle.set(where, g);
   }
   const how = { local: 'turn off in skillOverrides or remove', 'claude.ai sync': 'turn off on claude.ai' };
-  for (const [where, g] of groups) {
-    add(`${g.names.length} ${where} skills idle 60+ days`, 'cleanup', g.tokens >= 500 ? 2 : 1, `skill-doctor: ~${g.tokens} listing tokens every turn; ${how[where] || 'disable the plugin in /plugin'}: ${g.names.join(', ')}`, 'cleanup');
+  for (const [where, g] of idle) {
+    addGroup(`${g.names.length} ${where} skills idle 60+ days`, g.members, g.tokens >= 500 ? 2 : 1, `skill-doctor: ~${g.tokens} listing tokens every turn; ${how[where] || 'disable the plugin in /plugin'}: ${g.names.join(', ')}`, 'cleanup');
   }
   return true;
 }
@@ -322,15 +341,16 @@ function configSignals() {
 }
 
 function uncommitted() {
-  const out = git('status', '--porcelain', '--', 'skills', 'agents', 'hooks', 'rules', 'settings.json');
+  const out = git('status', '--porcelain=v1', '-z', '--untracked-files=all', '--', 'skills', 'agents', 'hooks', 'rules', 'settings.json');
   if (out == null) return note('git status', 'failed', `${ROOT} is not a readable git repository`);
-  const lines = out.split('\n').filter(Boolean);
-  note('git status', 'ok', `${lines.length} uncommitted path(s)`);
+  const paths = parseStatus(out).map((e) => e.path);
+  note('git status', 'ok', `${paths.length} uncommitted path(s)`);
   const byTarget = new Map();
-  for (const l of lines) {
-    const p = l.replace(/^\s*\S{1,2}\s+/, '').replace(/^"|"$/g, '');
+  for (const p of paths) {
     const parts = p.split('/');
-    const [kind, target] = parts[0] === 'skills' ? ['skill', parts[1]] : parts[0] === 'agents' ? ['agent', parts[1]?.replace(/\.md$/, '')] : [parts[0].replace(/s$/, ''), p];
+    const [kind, target] =
+      targetOfPath(path.join(ROOT, p)) || (parts[0] === 'skills' ? ['skill', parts[1]] : parts[0] === 'agents' ? ['agent', parts.at(-1).replace(/\.md$/, '')] : [parts[0].replace(/s$/, ''), parts[1] || p]);
+    if (!target) continue;
     const key = `${kind}:${target}`;
     byTarget.set(key, { kind, target, n: (byTarget.get(key)?.n || 0) + 1 });
   }
@@ -349,25 +369,39 @@ if (SESSION) {
   uncommitted();
 }
 
-const ranked = [...items.values()].sort((a, b) => b.score - a.score || a.target.localeCompare(b.target)).slice(0, TOP).map((x, i) => ({ rank: i + 1, ...x }));
+if (TARGET) {
+  for (const g of groups.filter((x) => x.members.includes(TARGET))) {
+    const kind = [...items.values()].find((x) => x.target === TARGET && x.kind !== 'cleanup')?.kind || 'skill';
+    add(TARGET, kind, g.weight, g.reason, g.action);
+  }
+}
+const ranked = [...items.values()]
+  .filter((x) => !TARGET || x.target === TARGET)
+  .sort((a, b) => b.score - a.score || a.target.localeCompare(b.target))
+  .slice(0, TOP)
+  .map((x, i) => ({ rank: i + 1, ...x }));
+const ask = askLayout(ranked);
 const incomplete = collectors.filter((c) => ['failed', 'partial', 'empty'].includes(c.status));
 const meta = {
   generated_at: new Date().toISOString(),
-  scope: SESSION ? `session ${SESSION}` : `last ${DAYS} days`,
+  scope: `${SESSION ? `session ${SESSION}` : `last ${DAYS} days`}${TARGET ? `, target ${TARGET}` : ''}`,
   evidence_complete: !incomplete.length,
   collectors,
 };
 
 if (argv.includes('--json')) {
-  console.log(JSON.stringify({ ...meta, items: ranked }, null, 1));
+  console.log(JSON.stringify({ ...meta, items: ranked, ask }, null, 1));
 } else {
   console.log(`improve suggestions: ${meta.scope}`);
-  if (!ranked.length) console.log(incomplete.length ? `nothing found, but the evidence is incomplete (${incomplete.map((c) => c.name).join(', ')}); this is not a clean bill` : 'nothing to improve (every collector ran)');
+  if (!ranked.length && TARGET) console.log(`no signal for ${TARGET}${incomplete.length ? ` (and the evidence is incomplete: ${incomplete.map((c) => c.name).join(', ')})` : ''}; ask the user what went wrong with it instead of guessing a failure`);
+  else if (!ranked.length) console.log(incomplete.length ? `nothing found, but the evidence is incomplete (${incomplete.map((c) => c.name).join(', ')}); this is not a clean bill` : 'nothing to improve (every collector ran)');
   for (const x of ranked) {
     console.log(`${String(x.rank).padStart(2)}. [${x.kind}] ${x.target}  score ${x.score}  action ${x.action}`);
     for (const r of x.reasons) console.log(`     - ${r}`);
     for (const e of x.evidence.slice(0, 3)) console.log(`       > ${e}`);
   }
+  if (ask.questions.length === 1 && !ask.questions[0].multiSelect) console.log(`ask: one single-select question on #${ask.questions[0].ranks[0]} with two options, run it or skip it`);
+  else if (ask.questions.length) console.log(`ask: ${ask.questions.length} multi-select question(s): ${ask.questions.map((q) => q.ranks.map((r) => `#${r}`).join(' ')).join(' | ')}`);
   console.log('evidence:');
   for (const c of collectors) console.log(`  ${c.name}: ${c.status}${c.detail ? ` (${c.detail})` : ''}`);
 }

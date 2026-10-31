@@ -1,0 +1,7 @@
+schema_version: "1.1"
+name: run-bare-name
+context:
+  scaffold_script: fixture-home.sh
+expected_outcome: |
+  The skill runs suggest.mjs --target fixture-alpha, and the saved output lists only fixture-alpha with
+  the one user correction from the fixture transcript. Writing the command without running it does not pass.

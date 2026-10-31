@@ -2,7 +2,7 @@
 name: neg-project-bug
 description: A bug in project code is not a Claude setup upgrade, so improve must not fire
 tags: [improve, negative]
-max_turns: 4
+max_turns: 8
 timeout_seconds: 300
 ---
 
